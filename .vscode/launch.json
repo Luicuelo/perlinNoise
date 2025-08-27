@@ -1,0 +1,20 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "type": "java",
+            "name": "PerlingNoise",
+            "request": "launch",
+            "mainClass": "principal.PerlingNoise",
+            "projectName": "perlinNoise_7b1c2bfc",
+            "vmArgs": "--module-path \"C:\\Program Files\\Java\\javafx-sdk-21.0.8\\lib\" --add-modules javafx.controls,javafx.graphics"
+        },        
+        {
+            "type": "java",
+            "name": "Current File",
+            "request": "launch",
+            "mainClass": "${file}",
+            "vmArgs": "--module-path \"C:\\Program Files\\Java\\javafx-sdk-21.0.8\\lib\" --add-modules javafx.controls,javafx.graphics"
+        }
+    ]
+}
