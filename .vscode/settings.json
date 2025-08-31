@@ -13,7 +13,7 @@
     "java.configuration.runtimes": [
         {
             "name": "JavaSE-17",
-            "path": "C:\\Program Files\\Java\\jdk-17.0.10",
+            "path": "C:\\Program Files\\Java\\jdk-25.0.1",
             "default": true
         }
     ],

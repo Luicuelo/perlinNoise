@@ -2,11 +2,8 @@ package principal;
 
 import javafx.scene.canvas.GraphicsContext;
 import javafx.scene.image.*;
-import javafx.scene.paint.Color;
 
-import javax.sound.sampled.*;
 import java.nio.ByteBuffer;
-import java.util.Arrays;
 
 /**
  * Renderer class for noise visualization.
@@ -14,52 +11,60 @@ import java.util.Arrays;
  */
 class Renderer {
 
-    /** Size of each cell in pixels */
-    protected int PIXEL_SIZE;
+    /**
+     * Real pixels occupied by each cell. It is the only conversion between the logical
+     * grid, where the noise is calculated, and the screen.
+     */
+    static final int PIXELS_PER_CELL = 4;
 
-    /** Default color for drawing */
-    private final Color defaultColor;
-    /** Background color for clearing areas */
-    private final Color backGroundColor;
+    /** Colours a palette can hold: one per unsigned byte value. */
+    private static final int PALETTE_SIZE = 256;
+
+    /** Bytes needed by one cell: its pixels, four bytes each. */
+    private static final int CELL_BUFFER_SIZE = PIXELS_PER_CELL * PIXELS_PER_CELL * 4;
+
     /** JavaFX graphics context for drawing */
     private final GraphicsContext gc;
-    /** Canvas width in pixels */
+    /** Canvas width in real pixels. */
     private final int width;
-    /** Canvas height in pixels */
+    /** Canvas height in real pixels. */
     private final int height;
-    /** Number of cells horizontally */
-    private final int cellWidth;
-    /** Number of cells vertically */
-    private final int cellHeight;
+    /** Width of the logical grid, in cells (columns). */
+    private final int widthInCells;
+    /** Height of the logical grid, in cells (rows). */
+    private final int heightInCells;
     /** Writable image for efficient pixel manipulation */
     private final WritableImage estadosImage;
     /** Pixel writer for direct pixel access */
     private final PixelWriter pixelWriter;
 
+    /** Shared pixel format instance to avoid repeated allocation */
+    private static final WritablePixelFormat<ByteBuffer> PIXEL_FORMAT = PixelFormat.getByteBgraInstance();
 
     /** Flag indicating if continuous iteration is active */
     private boolean runningIteration = false;
     /** Flag indicating if single step mode is active */
     private boolean runningStep = false;
-    /** Reusable buffer for pixel data to avoid allocations */
-    private byte[] blockBuffer = new byte[PIXEL_SIZE * PIXEL_SIZE * 4];
-
-    private final Color[] palette = new Color[256];
+    /**
+     * Action executed once per animated frame. It is provided by the application
+     * because advancing the world requires the noise generators and the offsets,
+     * which do not belong to the renderer.
+     */
+    private Runnable iterationAction;
+    /** Reusable buffer holding the pixels of one cell, filled by {@link #fillCellBuffer(byte[])} */
+    private final byte[] cellBuffer;
+    /** Palette as byte arrays (4 bytes each) for direct buffer writes */
+    private final byte[][] paletteBytes;
 
     /**
      * Creates a new Renderer for noise visualization.
      * 
-     * @param gc              the graphics context to draw on (must not be null)
-     * @param w               canvas width in pixels (must be positive)
-     * @param h               canvas height in pixels (must be positive)
-     * @param pPIXEL_SIZE     pixel size for each cell
-     * @param barsColor       color for drawing
-     * @param backGroundColor color for the background
+     * @param gc the graphics context to draw on (must not be null)
+     * @param w  canvas width in real pixels (must be positive)
+     * @param h  canvas height in real pixels (must be positive)
      * @throws IllegalArgumentException if gc is null or dimensions are invalid
      */
-    public Renderer(GraphicsContext gc, int w, int h, int pPIXEL_SIZE, Color barsColor, Color backGroundColor) {
-        PIXEL_SIZE = pPIXEL_SIZE;
-        blockBuffer = new byte[PIXEL_SIZE * PIXEL_SIZE * 4];
+    public Renderer(GraphicsContext gc, int w, int h) {
         if (gc == null) {
             throw new IllegalArgumentException("GraphicsContext cannot be null");
         }
@@ -67,25 +72,98 @@ class Renderer {
             throw new IllegalArgumentException("Width and height must be positive");
         }
 
-        this.defaultColor = barsColor;
-        this.backGroundColor = backGroundColor;
         this.gc = gc;
         this.width = w;
         this.height = h;
-        this.cellWidth = width / PIXEL_SIZE;
-        this.cellHeight = height / PIXEL_SIZE;
+        this.widthInCells = width / PIXELS_PER_CELL;
+        this.heightInCells = height / PIXELS_PER_CELL;
+
+        this.cellBuffer = new byte[CELL_BUFFER_SIZE];
+        this.paletteBytes = new byte[PALETTE_SIZE][4];
 
         // Create writable image and pixel writer for efficient drawing
-        estadosImage = new WritableImage(width, height);
-        pixelWriter = estadosImage.getPixelWriter();
-
+        this.estadosImage = new WritableImage(width, height);
+        this.pixelWriter = estadosImage.getPixelWriter();
     }
 
+    /**
+     * Width of the logical grid in cells.
+     *
+     * @return number of columns, in cells
+     */
+    public int widthInCells() {
+        return widthInCells;
+    }
+
+    /**
+     * Height of the logical grid in cells.
+     *
+     * @return number of rows, in cells
+     */
+    public int heightInCells() {
+        return heightInCells;
+    }
+
+    /**
+     * Scales a 0..1 colour component to the 0..255 range, clamping it.
+     *
+     * @param component colour component, normally in the range 0..1
+     * @return the component scaled to 0..255
+     */
+    private static int toByte(double component) {
+        return (int) Math.max(0, Math.min(255, component * 255));
+    }
+
+    /**
+     * Writes one opaque colour, given as red/green/blue, into a BGRA buffer.
+     *
+     * @param target buffer that receives the colour
+     * @param offset byte offset of the pixel
+     * @param red    red component, 0..255
+     * @param green  green component, 0..255
+     * @param blue   blue component, 0..255
+     */
+    private static void putRgb(byte[] target, int offset, int red, int green, int blue) {
+        target[offset] = (byte) blue;
+        target[offset + 1] = (byte) green;
+        target[offset + 2] = (byte) red;
+        target[offset + 3] = (byte) 255;
+    }
+
+    /**
+     * Copies one colour, already in B, G, R, A order, into a BGRA buffer.
+     *
+     * @param target buffer that receives the colour
+     * @param offset byte offset of the pixel
+     * @param bgra   colour to copy
+     */
+    private static void putBgra(byte[] target, int offset, byte[] bgra) {
+        target[offset] = bgra[0];
+        target[offset + 1] = bgra[1];
+        target[offset + 2] = bgra[2];
+        target[offset + 3] = bgra[3];
+    }
+
+    /**
+     * Registers the action executed once per animated frame.
+     * <p>
+     * Without an action the Iterate and Step modes are no-ops, so the owner of the
+     * noise generation is expected to provide one right after construction.
+     * </p>
+     *
+     * @param action the per-frame action, may be null to disable animation
+     */
+    public void setIterationAction(Runnable action) {
+        this.iterationAction = action;
+    }
+
+    /**
+     * Initializes the palette with a black to white ramp.
+     */
     public void initializePaletteGray() {
-        for (int i = 0; i < palette.length; i++) {
-            double gray = (double) i / (double) palette.length;
-            Color color = new Color(gray, gray, gray, 1);
-            palette[i] = color;
+        for (int i = 0; i < PALETTE_SIZE; i++) {
+            int gray = (int) ((double) i / (PALETTE_SIZE - 1) * 255);
+            putRgb(paletteBytes[i], 0, gray, gray, gray);
         }
     }
 
@@ -105,57 +183,96 @@ class Renderer {
      * </p>
      */
     public void initializePaletteColor() {
-          for (int i = 0; i < palette.length; i++) {
-            double value = (double) i / (palette.length - 1);
+        final float DARK_BLUE = 0.3F;
+        final float BLUE = 0.4F;
+        final float YELLOW = 0.5F;
+        final float BROWN = 0.6F;
+        final float GREEN = 0.7F;
+        final float GREY = 0.8F;
 
-            final float DARK_BLUE = 0.3F;
-            final float BLUE = 0.4F;
-            final float YELLOW = 0.5F;
-            final float BROWN = 0.6F;
-            final float GREEN = 0.7F;
-            final float GREY = 0.8F;
+        for (int i = 0; i < PALETTE_SIZE; i++) {
+            double value = (double) i / (PALETTE_SIZE - 1);
+
+            int r, g, b;
 
             // Define color components for different terrain types
             if (value < DARK_BLUE) {
                 // Deep water (dark blue)
                 double factor = value / DARK_BLUE;
-                palette[i] = new Color(0, 0, Math.max(0, Math.min(1, 0.5 + 0.5 * factor)), 1);
+                b = toByte(0.5 + 0.5 * factor);
+                r = 0;
+                g = 0;
             } else if (value < BLUE) {
                 // Water (blue)
                 double factor = (value - DARK_BLUE) / 0.1;
-                palette[i] = new Color(0, Math.max(0, Math.min(1, 0.2 * factor)), Math.max(0, Math.min(1, 0.8 + 0.2 * (1 - factor))), 1);
+                r = 0;
+                g = toByte(0.2 * factor);
+                b = toByte(0.8 + 0.2 * (1 - factor));
             } else if (value < YELLOW) {
                 // Coast (yellow)
                 double factor = (value - BLUE) / 0.1;
-                palette[i] = new Color(Math.max(0, Math.min(1, 0.8 + 0.2 * factor)), Math.max(0, Math.min(1, 0.8 + 0.2 * factor)), Math.max(0, Math.min(1, 0.2 * (1 - factor))), 1);
+                r = toByte(0.8 + 0.2 * factor);
+                g = toByte(0.8 + 0.2 * factor);
+                b = toByte(0.2 * (1 - factor));
             } else if (value < BROWN) {
                 // Land (brown)
                 double factor = (value - YELLOW) / 0.2;
-                palette[i] = new Color(Math.max(0, Math.min(1, 0.5 + 0.3 * factor)), Math.max(0, Math.min(1, 0.4 + 0.2 * factor)), Math.max(0, Math.min(1, 0.2 * (1 - factor))), 1);
+                r = toByte(0.5 + 0.3 * factor);
+                g = toByte(0.4 + 0.2 * factor);
+                b = toByte(0.2 * (1 - factor));
             } else if (value < GREEN) {
                 // Higher terrain (green)
                 double factor = (value - BROWN) / 0.2;
-                palette[i] = new Color(Math.max(0, Math.min(1, 0.2 + 0.2 * factor)), Math.max(0, Math.min(1, 0.8 + 0.2 * factor)), Math.max(0, Math.min(1, 0.1 * (1 - factor))), 1);
+                r = toByte(0.2 + 0.2 * factor);
+                g = toByte(0.8 + 0.2 * factor);
+                b = toByte(0.1 * (1 - factor));
             } else if (value < GREY) {
                 // Mountains (grey)
                 double factor = (value - GREEN) / 0.2;
-                palette[i] = new Color(Math.max(0, Math.min(1, 0.4 + 0.4 * factor)), Math.max(0, Math.min(1, 0.4 + 0.4 * factor)), Math.max(0, Math.min(1, 0.4 + 0.4 * factor)), 1);
+                r = toByte(0.4 + 0.4 * factor);
+                g = toByte(0.4 + 0.4 * factor);
+                b = toByte(0.4 + 0.4 * factor);
             } else {
                 // Snow (white)
                 double factor = (value - GREY) / 0.1;
-                palette[i] = new Color(Math.max(0, Math.min(1, 0.7 + 0.3 * factor)), Math.max(0, Math.min(1, 0.7 + 0.3 * factor)), Math.max(0, Math.min(1, 0.7 + 0.3 * factor)), 1);
+                r = toByte(0.7 + 0.3 * factor);
+                g = toByte(0.7 + 0.3 * factor);
+                b = toByte(0.7 + 0.3 * factor);
             }
+
+            putRgb(paletteBytes[i], 0, r, g, b);
         }
     }
 
-    public void drawPixels(byte[][] cells) {
-        for (int a = 0; a < cellHeight; a++)
-            for (int b = 0; b < cellWidth; b++) {
-                // Convert byte to unsigned int (0-255 range) to use as palette index
-                int paletteIndex = cells[a][b] & 0xFF;
-                pixelToScreen(b, a, palette[paletteIndex]);
+    /**
+     * Paints a whole grid of palette indexes, one cell per entry.
+     *
+     * @param cells palette index per cell, addressed as {@code cells[row][column]}
+     */
+    public void drawCells(byte[][] cells) {
+        for (int row = 0; row < heightInCells; row++) {
+            for (int column = 0; column < widthInCells; column++) {
+                // Bytes are signed: mask them to use the value as a palette index.
+                fillCellBuffer(paletteBytes[Byte.toUnsignedInt(cells[row][column])]);
+                drawCell(column, row);
             }
+        }
         gc.drawImage(estadosImage, 0, 0);
+    }
+
+    /**
+     * Copies the reusable cell buffer to the screen at the given cell position.
+     *
+     * @param column cell column
+     * @param row    cell row
+     */
+    private void drawCell(int column, int row) {
+        int screenX = column * PIXELS_PER_CELL;
+        int screenY = row * PIXELS_PER_CELL;
+        if (screenX + PIXELS_PER_CELL <= width && screenY + PIXELS_PER_CELL <= height) {
+            pixelWriter.setPixels(screenX, screenY, PIXELS_PER_CELL, PIXELS_PER_CELL,
+                    PIXEL_FORMAT, cellBuffer, 0, PIXELS_PER_CELL * 4);
+        }
     }
 
     /**
@@ -163,8 +280,11 @@ class Renderer {
      * Sets all pixels to transparent and fills the background.
      */
     public void clearImage() {
-        pixelWriter.setPixels(0, 0, width, height, PixelFormat.getByteBgraInstance(), new byte[width * height * 4], 0,
-                width * 4);
+        // A fresh byte array is already all zeros, that is, fully transparent.
+        byte[] transparentRow = new byte[width * 4];
+        for (int y = 0; y < height; y++) {
+            pixelWriter.setPixels(0, y, width, 1, PIXEL_FORMAT, transparentRow, 0, width * 4);
+        }
         gc.fillRect(0, 0, width, height);
         gc.drawImage(estadosImage, 0, 0);
         System.out.println("Image Drawn");
@@ -172,134 +292,46 @@ class Renderer {
 
     /**
      * Updates the visual representation by processing one animation frame.
-     * Only processes if iteration or step mode is active.
+     * Only processes if iteration or step mode is active. The drawing itself is
+     * done by the iteration action, so no extra repaint is needed here.
      */
     public void updateRegion() {
         if (!runningIteration && !runningStep)
             return;
         iteration();
         runningStep = false;
-        gc.drawImage(estadosImage, 0, 0);
     }
 
     /**
-     * Processes one iteration of the animation queue.
-     * Executes the current action and removes it when complete.
+     * Processes one iteration of the animation queue by delegating to the action
+     * registered with {@link #setIterationAction(Runnable)}.
      */
     public void iteration() {
-
-    }
-
-    /**
-     * Clears a rectangular area by filling it with the background color.
-     * 
-     * @param x       horizontal position in cells
-     * @param y       vertical position in cells
-     * @param rwidth  width in cells
-     * @param rheight height in cells
-     */
-    protected void clearRectangle(int x, int y, int rwidth, int rheight) {
-
-        WritablePixelFormat<ByteBuffer> pixelFormat = PixelFormat.getByteBgraInstance();
-        for (int cy = Math.max(0, y); cy < Math.min(cellHeight, y + rheight); cy++) {
-            for (int cx = Math.max(0, x); cx < Math.min(cellWidth, x + rwidth); cx++) {
-                int screenX = cx * PIXEL_SIZE;
-                int screenY = cy * PIXEL_SIZE;
-
-                for (int py = 0; py < PIXEL_SIZE; py++) {
-                    for (int px = 0; px < PIXEL_SIZE; px++) {
-                        int pos = (py * PIXEL_SIZE + px) * 4;
-
-                        blockBuffer[pos] = (byte) (backGroundColor.getBlue() * 255); // Blue - inner color
-                        blockBuffer[pos + 1] = (byte) (backGroundColor.getGreen() * 255); // Green
-                        blockBuffer[pos + 2] = (byte) (backGroundColor.getRed() * 255); // Red
-                        blockBuffer[pos + 3] = (byte) 255;
-                    }
-                }
-
-                if (screenX + PIXEL_SIZE <= width && screenY + PIXEL_SIZE <= height) {
-                    pixelWriter.setPixels(screenX, screenY, PIXEL_SIZE, PIXEL_SIZE, pixelFormat, blockBuffer, 0,
-                            PIXEL_SIZE * 4);
-                }
-            }
-        }
-    }
-
-    protected void pixelToScreen(int x, int y, Color color) {
-        rectangleToScreen(x, y, 1, 1, false, false, color);
-    }
-
-    protected void rectangleToScreen(int x, int y, int rwidth, int rheight, boolean hasFrame, boolean hasSpace) {
-        rectangleToScreen(x, y, rwidth, rheight, hasFrame, hasSpace, defaultColor);
-    }
-
-    /**
-     * Draws a rectangle to the screen with specified color and styling options.
-     * 
-     * @param x        horizontal position in cells
-     * @param y        vertical position in cells
-     * @param rwidth   width in cells
-     * @param rheight  height in cells
-     * @param hasFrame whether to draw a frame around the rectangle
-     * @param hasSpace whether to leave spacing around the rectangle
-     * @param color    the color to use for drawing
-     */
-    protected void rectangleToScreen(int x, int y, int rwidth, int rheight, boolean hasFrame, boolean hasSpace,
-            Color color) {
-        WritablePixelFormat<ByteBuffer> pixelFormat = PixelFormat.getByteBgraInstance();
-
-        for (int cy = Math.max(0, y); cy < Math.min(cellHeight, y + rheight); cy++) {
-            for (int cx = Math.max(0, x); cx < Math.min(cellWidth, x + rwidth); cx++) {
-                int screenX = cx * PIXEL_SIZE;
-                int screenY = cy * PIXEL_SIZE;
-
-                boolean leftBorder = (cx == x);
-                boolean rightBorder = (cx == x + rwidth - 1);
-                boolean topBorder = (cy == y);
-                boolean bottomBorder = (cy == y + rheight - 1);
-
-                // Clear the entire block first
-                // The Alpha is 0 is not going to draw
-                Arrays.fill(blockBuffer, (byte) 0);
-
-                int startPx = (hasSpace && leftBorder) ? 1 : 0;
-                // int endPx = (hasSpace && rightBorder) ? PIXEL_SIZE - 1 : PIXEL_SIZE;
-                int endPx = PIXEL_SIZE;
-                int startPy = 0;
-                int endPy = (hasSpace && bottomBorder) ? PIXEL_SIZE - 1 : PIXEL_SIZE;
-
-                for (int py = startPy; py < endPy; py++) {
-                    for (int px = startPx; px < endPx; px++) {
-                        int pos = (py * PIXEL_SIZE + px) * 4;
-
-                        if (!(hasFrame &&
-                                ((leftBorder && px == startPx) ||
-                                        (rightBorder && px == endPx - 1) ||
-                                        (topBorder && py == startPy) ||
-                                        (bottomBorder && py == endPy - 1)))) {
-                            blockBuffer[pos] = (byte) (color.getBlue() * 255); // Blue - inner color
-                            blockBuffer[pos + 1] = (byte) (color.getGreen() * 255); // Green
-                            blockBuffer[pos + 2] = (byte) (color.getRed() * 255); // Red
-                        }
-                        blockBuffer[pos + 3] = (byte) 255;
-                    }
-                }
-
-                if (screenX + PIXEL_SIZE <= width && screenY + PIXEL_SIZE <= height) {
-                    pixelWriter.setPixels(screenX, screenY, PIXEL_SIZE, PIXEL_SIZE,
-                            pixelFormat, blockBuffer, 0, PIXEL_SIZE * 4);
-                }
-            }
+        if (iterationAction != null) {
+            iterationAction.run();
         }
     }
 
     /**
-     * Restarts the visualization by stopping any ongoing animation.
-     * Resets the animation state to allow for a fresh start.
+     * Fills the whole cell buffer with one colour, ready to be copied to the screen by
+     * {@link #drawCell(int, int)}.
+     *
+     * @param colorBytes colour in B, G, R, A order
      */
-    public void restart() {
+    private void fillCellBuffer(byte[] colorBytes) {
+        for (int offset = 0; offset < CELL_BUFFER_SIZE; offset += 4) {
+            putBgra(cellBuffer, offset, colorBytes);
+        }
+    }
+
+    /**
+     * Resets the animation state, cancelling both Iterate and Step modes.
+     * Called when the view is restarted or the noise mode changes.
+     */
+    public void resetIteration() {
 
         runningIteration = false;
+        runningStep = false;
     }
 
     /**
@@ -325,16 +357,6 @@ class Renderer {
      */
     public void step() {
         runningStep = true;
-    }
-
-    /**
-     * Creates an inverted version of the given color.
-     * 
-     * @param color the original color
-     * @return a new color with inverted RGB values
-     */
-    private Color invertColor(Color color) {
-        return new Color(1 - color.getRed(), 1 - color.getGreen(), 1 - color.getBlue(), color.getOpacity());
     }
 
 }
